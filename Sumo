@@ -14,15 +14,15 @@ class RobotMover(Node):
     def __init__(self):
         super().__init__('robot_mover')
         self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.buzzer_pub = self.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1)
+        #self.buzzer_pub = self.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1)
         
         # CV Bridge and frame storage.
         self.bridge = CvBridge()
         self.frame = None
 
         # State flags.
-        self.face_detected = False
-        self.current_gesture = None
+        #self.face_detected = False
+        #self.current_gesture = None
 
         # Debug flag.
         self.debug = True
@@ -66,7 +66,7 @@ class RobotMover(Node):
     ##################################################
     def move_towards_red_marker(self):
         if self.frame is None:
-            return
+            return False
         #Convert the image to HSV color space
         hsv_frame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
 
@@ -109,6 +109,25 @@ class RobotMover(Node):
                     angular_z = -float(error) / (frame_width // 2) #Normalize error
                     self.move_robot(0.0, 0.0, angular_z, 0.1) #Rotate towards the marker
 
+                return True #Red marker detected
+        return False #No red marker detected
+    
+    ##################################################
+    # Search for the red marker
+    ##################################################
+    
+    def search_for_red_marker(self):
+        self.get_logger().info("Searching for red marker ...")
+        while rclpy.ok():
+            #rotate in place
+            self.move_robot(0.0, 0.0, 0.5, 0.1) #Rotate at a speed of 0.5 rad/s for 0.1 seconds
+
+            #checks for red marker
+            if self.move_towards_red_marker():
+                self.get_logger().info("Red marker detected!")
+                break #Exit the loop if the red marker is found
+
+
     ##################################################
     # Frame Processing / Subscription Loop
     ##################################################
@@ -128,14 +147,15 @@ class RobotMover(Node):
                     time.sleep(0.05)
                     continue
 
-                #Procss the frame to move towards the red marker
-                self.move_towards_red_marker()
+                #Process the frame to move towards the red marker
+                if not self.move_towards_red_marker():
+                    self.search_for_red_marker() #Search for the red marker if not detected
 
                 cv2.imshow("Robot Camera Feed", self.frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
             except Exception as ex:
-                self.get_logger().error("Erro in sensor_listener loop: " + str(ex))
+                self.get_logger().error("Error in sensor_listener loop: " + str(ex))
                 print("DEBUG: Error in sensor_listener loop: ", ex)
             time.sleep(0.05)
         cv2.destroyAllWindows()
