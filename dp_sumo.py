@@ -51,7 +51,7 @@ class RobotMover(Node):
         # LiDAR / LaserScan State
         ##################################################
         self.min_lidar_distance = float('inf')
-        self.wall_distance_threshold = 0.25  # meters
+        self.wall_distance_threshold = 0.20  # meters
 
         ##################################################
         # ROS Subscribers
@@ -66,7 +66,7 @@ class RobotMover(Node):
         # LiDAR / LaserScan subscriber
         self.create_subscription(
             LaserScan,
-            '/scan',  # Adjust if your LiDAR topic is different
+            '/scan_raw',  # Adjust if your LiDAR topic is different
             self.lidar_callback,
             1
         )
@@ -257,7 +257,7 @@ class RobotMover(Node):
                 if not self.opponent_detected:
                     strategy = None
 
-            time.sleep(0.025)
+            time.sleep(0.020)
 
     ##################################################
     # Main Sumo Routine
@@ -265,7 +265,7 @@ class RobotMover(Node):
     def run_sumo(self):
         self.get_logger().info("Robot ready for sumo wrestling. Starting quick attack loop...")
         while self.frame is None and rclpy.ok():
-            time.sleep(0.05)  # Wait until the first frame is received
+            time.sleep(0.01)  # Wait until the first frame is received
         self.attack_opponent()
 
 def main(args=None):
