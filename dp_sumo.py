@@ -51,7 +51,7 @@ class RobotMover(Node):
         # LiDAR / LaserScan State
         ##################################################
         self.min_lidar_distance = float('inf')
-        self.wall_distance_threshold = 0.20  # meters
+        self.wall_distance_threshold = 0.25  # meters
 
         ##################################################
         # ROS Subscribers
@@ -216,15 +216,28 @@ class RobotMover(Node):
         to scan for one. Also, continuously check LiDAR to avoid walls.
         """
         strategy = None
+        wall_avoidance_time = 0.0
+        wall_avoiding = False
 
         while rclpy.ok():
             # Check for nearby wall using LiDAR
             if self.min_lidar_distance < self.wall_distance_threshold:
-                if self.debug:
-                    self.get_logger().info("Wall detected! Avoiding wall quickly...")
+                if not wall_avoiding:
+                    wall_avoiding = True
+                    wall_avoidance_time = 0.0
+                    if self.debug:
+                        self.get_logger().info("Wall detected! Avoiding wall quickly...")
+                
+                wall_avoidance_time += 0.02
+
                 # Faster wall avoidance maneuver
                 self.move_robot(-0.5, 0.0, 0.0, 0.4)
                 self.move_robot(0.0, 0.0, 1.5, 0.4)
+                
+                if wall_avoidance_time > 2.0:
+                    if self.debug:
+                        self.get_logger.info("Stopping wall avoidance after timeout")
+                    wall_avoiding = False
                 continue
 
             # If no opponent is detected, rotate quickly to search
