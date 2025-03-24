@@ -1,196 +1,301 @@
 #!/usr/bin/env python3
-import numpy as np
+import time
+import threading
+import random
+import math
+
 import rclpy
 from rclpy.node import Node
+
+# ROS 2 message types
 from geometry_msgs.msg import Twist
-import time, threading, math
-import cv2
-import mediapipe as mp
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 from cv_bridge import CvBridge
-from ros_robot_controller_msgs.msg import BuzzerState
+
+# External libraries for OpenCV and numeric operations
+import cv2
+import numpy as np
+
+class AttackStrategy:
+    """Enumeration of different attack strategies."""
+    DIRECT = 1
+    ZIGZAG = 2
+    CIRCLE = 3
+    DEFENSIVE = 4
 
 class RobotMover(Node):
     def __init__(self):
         super().__init__('robot_mover')
-        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
-        #self.buzzer_pub = self.create_publisher(BuzzerState, '/ros_robot_controller/set_buzzer', 1)
-        
-        # CV Bridge and frame storage.
+        self.debug = True  # Toggle for debug info
+
+        ##################################################
+        # Publishers
+        ##################################################
+        self.publisher_cmd_vel = self.create_publisher(Twist, 'cmd_vel', 10)
+
+        ##################################################
+        # CV Bridge and Frame Handling
+        ##################################################
         self.bridge = CvBridge()
         self.frame = None
+        self.frame_lock = threading.Lock()  # Lock to safely access self.frame
 
-        # State flags.
-        #self.face_detected = False
-        #self.current_gesture = None
+        ##################################################
+        # Opponent Detection State
+        ##################################################
+        self.opponent_detected = False
+        self.opponent_center = None
+        self.opponent_area = 0  # Area of the detected contour (used to gauge proximity/aggression)
 
-        # Debug flag.
-        self.debug = True
+        ##################################################
+        # LiDAR / LaserScan State
+        ##################################################
+        self.min_lidar_distance = float('inf')
+        self.wall_distance_threshold = 0.25  # meters
 
+        ##################################################
+        # ROS Subscribers
+        ##################################################
+        # Camera subscriber
+        self.create_subscription(
+            Image, 
+            'ascamera/camera_publisher/rgb0/image',
+            self.image_callback,
+            1
+        )
+        # LiDAR / LaserScan subscriber
+        self.create_subscription(
+            LaserScan,
+            '/scan_raw',  # Adjust if your LiDAR topic is different
+            self.lidar_callback,
+            1
+        )
 
-        # Subscribe to the camera image topic.
-        self.create_subscription(Image, 'ascamera/camera_publisher/rgb0/image',
-                                 self.image_callback, 1)
-
+    ##################################################
+    # Image Callback: Fast Orange Detection
+    ##################################################
     def image_callback(self, msg):
+        """
+        Convert the incoming image to a smaller frame for faster processing.
+        Detect orange color by converting to HSV and using inRange,
+        then find the largest contour (the opponent) and compute its center and area.
+        """
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            self.frame = cv_image
-            if self.debug:
-                self.get_logger().info("Image received in callback.")
-                print("DEBUG: Image received in callback.")
         except Exception as e:
-            self.get_logger().error("Failed to convert image: " + str(e))
-            print("DEBUG: Error in image callback:", e)
+            self.get_logger().error(f"Failed to convert image: {e}")
+            return
+
+        # Resize for faster processing (lower resolution)
+        resized = cv2.resize(cv_image, (320, 240))
+        hsv_frame = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+
+        # ----- Tweak these boundaries as needed for your lighting/environment -----
+        lower_orange = np.array([5, 150, 100])
+        upper_orange = np.array([20, 255, 255])
+        mask = cv2.inRange(hsv_frame, lower_orange, upper_orange)
+
+        # Apply Gaussian blur to reduce noise, then morphological ops
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        # Find contours in the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(largest_contour)
+            self.opponent_area = area
+
+            M = cv2.moments(largest_contour)
+            if M["m00"] > 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                self.opponent_detected = True
+                self.opponent_center = (cX, cY)
+                # For debugging: draw the detected contour and center
+                cv2.drawContours(resized, [largest_contour], -1, (0, 255, 0), 2)
+                cv2.circle(resized, (cX, cY), 5, (255, 255, 255), -1)
+            else:
+                self.opponent_detected = False
+                self.opponent_center = None
+                self.opponent_area = 0
+        else:
+            self.opponent_detected = False
+            self.opponent_center = None
+            self.opponent_area = 0
+
+        # Save the processed frame for potential debugging
+        with self.frame_lock:
+            self.frame = resized
 
     ##################################################
-    # Basic Movements
+    # LiDAR Callback: Wall Detection
     ##################################################
-    def move_robot(self, x, y, z, duration):
+    def lidar_callback(self, msg: LaserScan):
+        """
+        Update the minimum distance reading from the LiDAR.
+        Warn if no valid ranges are received.
+        """
+        valid_ranges = [r for r in msg.ranges if not math.isinf(r) and not math.isnan(r)]
+        if valid_ranges:
+            self.min_lidar_distance = min(valid_ranges)
+        else:
+            self.min_lidar_distance = float('inf')
+            self.get_logger().warning("No valid LiDAR data received!")
+
+    ##################################################
+    # Movement and Helper Functions
+    ##################################################
+    def move_robot(self, linear_x, linear_y, angular_z, duration):
+        """
+        Publish movement commands at ~40 Hz for a given duration,
+        then stop the robot.
+        """
         msg = Twist()
-        msg.linear.x = float(x)
-        msg.linear.y = float(y)
-        msg.angular.z = float(z)
+        msg.linear.x = float(linear_x)
+        msg.linear.y = float(linear_y)
+        msg.angular.z = float(angular_z)
+
         start_time = time.time()
+        rate = 0.025  # seconds per command (~40 Hz)
         while (time.time() - start_time < duration) and rclpy.ok():
-            self.publisher_.publish(msg)
-            time.sleep(0.05)
+            self.publisher_cmd_vel.publish(msg)
+            time.sleep(rate)
         self.stop_robot()
 
     def stop_robot(self):
+        """Send a zero velocity command to stop the robot."""
         msg = Twist()
-        self.publisher_.publish(msg)
+        self.publisher_cmd_vel.publish(msg)
 
     ##################################################
-    # Move towards the marker
+    # Strategy Functions
     ##################################################
-    def move_towards_red_marker(self):
-        if self.frame is None:
-            return False
-        #Convert the image to HSV color space
-        hsv_frame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2HSV)
+    def get_random_attack_strategy(self):
+        """Randomly pick one of the attack strategies (excluding DEFENSIVE)."""
+        return random.choice([AttackStrategy.DIRECT, AttackStrategy.ZIGZAG, AttackStrategy.CIRCLE])
 
-        #Define the range for the red color
-        lower_red = np.array([0, 100, 100])
-        upper_red = np.array([10, 255, 255])
-        lower_red2 = np.array([160, 100, 100])
-        upper_red2 = np.array([180, 255, 255])
+    def execute_attack_strategy(self, strategy, frame_center_x, cX):
+        """
+        Execute the chosen attack or defensive strategy.
+        The 'frame_center_x' is the horizontal midpoint of the image;
+        'cX' is the horizontal position of the detected opponent.
+        """
+        # Calculate angular correction (proportional controller)
+        error_x = cX - frame_center_x
+        max_error = frame_center_x if frame_center_x != 0 else 1
+        angular_z = -float(error_x) / max_error
 
-        #create masks for red color
-        mask1 = cv2.inRange(hsv_frame, lower_red, upper_red)
-        mask2 = cv2.inRange(hsv_frame, lower_red2, upper_red2)
-        mask = mask1 | mask2
+        if strategy == AttackStrategy.DIRECT:
+            # Increase speed: move forward aggressively while turning slightly toward target
+            self.move_robot(0.5, 0.0, angular_z, 0.08)
+        elif strategy == AttackStrategy.ZIGZAG:
+            # Faster zigzag: alternate turning directions while advancing
+            sign = 1 if random.random() < 0.5 else -1
+            self.move_robot(0.4, 0.0, sign * 1.2, 0.15)
+            self.move_robot(0.4, 0.0, -sign * 1.2, 0.15)
+        elif strategy == AttackStrategy.CIRCLE:
+            # Quicker circling: move in an arc and then approach
+            self.move_robot(0.3, 0.0, 1.5, 0.3)
+            self.move_robot(0.5, 0.0, angular_z, 0.2)
+        elif strategy == AttackStrategy.DEFENSIVE:
+            # Quicker defensive maneuver: back off and rotate rapidly
+            self.move_robot(-0.4, 0.0, 0.7, 0.2)
+            self.move_robot(-0.5, 0.0, 0.0, 0.15)
 
-        #Find contours of the red areas
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    ##################################################
+    # Attack and Defensive Loop
+    ##################################################
+    def attack_opponent(self):
+        """
+        Main loop: if an opponent is detected, choose an attack strategy.
+        If the opponent appears to be attacking (e.g. large contour area),
+        switch to a defensive strategy. If no opponent is seen, rotate quickly
+        to scan for one. Also, continuously check LiDAR to avoid walls.
+        """
+        strategy = None
+        wall_avoiding = False
 
-        if contours:
-            #Find the largest contour
-            largest_contour = max(contours, key = cv2.contourArea)
-            M = cv2.moments(largest_contour)
-            if M["m00"] > 0:
-                #Calculate the center of the contour
-                cX = int(M["m10"] / M["m00"])
-                cY = int(M["m01"] / M["m00"])
-
-                #Draw the contour and center on the frame
-                cv2.drawContours(self.frame, [largest_contour], -1, (0, 255, 0), 2)
-                cv2.circle(self.frame, (cX, cY), 7, (255, 255, 255), -1)
-
-                #Move towards the red marker
-                #Assuming the frame width is 320, adjust the movement basedon the position of the center
-                frame_width = self.frame.shape[1]
-                error = cX - (frame_width // 2)
-
-                #Simple proportional control
-                if abs(error) < 20:
-                    self.move_robot(0.2, 0.0, 0.0, 0.1) #Move forward
+        while rclpy.ok():
+            # Wall avoidance takes priority but should be smarter
+            if self.min_lidar_distance < self.wall_distance_threshold:
+                if self.debug:
+                    self.get_logger().info(f"Wall detected at distance: {self.min_lidar_distance}m")
+                
+                # Smarter wall avoidance - back up only briefly then try to turn away
+                self.move_robot(-0.3, 0.0, 0.0, 0.2)  # Gentler backup
+                
+                # If we detect the opponent while avoiding wall, turn towards it while backing up
+                if self.opponent_detected and self.opponent_center is not None:
+                    frame_center_x = self.frame.shape[1] // 2 if self.frame is not None else 0
+                    error_x = self.opponent_center[0] - frame_center_x
+                    # Turn towards opponent while backing up
+                    turn_direction = -1 if error_x > 0 else 1
+                    self.move_robot(-0.2, 0.0, turn_direction * 1.0, 0.3)
                 else:
-                    angular_z = -float(error) / (frame_width // 2) #Normalize error
-                    self.move_robot(0.0, 0.0, angular_z, 0.1) #Rotate towards the marker
+                    # No opponent visible, do a quick rotation to find new direction
+                    self.move_robot(0.0, 0.0, 1.0, 0.3)
+                
+                continue
 
-                return True #Red marker detected
-        return False #No red marker detected
-    
-    ##################################################
-    # Search for the red marker
-    ##################################################
-    
-    def search_for_red_marker(self):
-        self.get_logger().info("Searching for red marker ...")
-        while rclpy.ok():
-            #rotate in place
-            self.move_robot(0.0, 0.0, 0.5, 0.1) #Rotate at a speed of 0.5 rad/s for 0.1 seconds
+            # If no opponent is detected, rotate quickly to search
+            if not self.opponent_detected:
+                if self.debug:
+                    self.get_logger().info("No opponent detected. Scanning quickly...")
+                self.move_robot(0.0, 0.0, 2.0, 0.08)  # Slightly slower rotation for better detection
+                strategy = None
+            else:
+                # Opponent detected - adjust strategy based on distance
+                with self.frame_lock:
+                    frame_center_x = self.frame.shape[1] // 2 if self.frame is not None else 0
+                    cX = self.opponent_center[0] if self.opponent_center is not None else frame_center_x
 
-            #checks for red marker
-            if self.move_towards_red_marker():
-                self.get_logger().info("Red marker detected!")
-                break #Exit the loop if the red marker is found
-
-
-    ##################################################
-    # Frame Processing / Subscription Loop
-    ##################################################
-    def sensor_listener(self):
-        # Wait for the first frame.
-        while self.frame is None and rclpy.ok():
-            if self.debug:
-                self.get_logger().info("Waiting for first frame...")
-                print("DEBUG: Waiting for first frame...")
-            time.sleep(0.1)
-        while rclpy.ok():
-            try:
-                if self.frame is None:
+                # Use area to determine if we're too close to opponent
+                if self.opponent_area > 8000:  # Increased threshold
                     if self.debug:
-                        self.get_logger().info("No frame available yet.")
-                        print("DEBUG: No frame available yet.")
-                    time.sleep(0.05)
-                    continue
+                        self.get_logger().info("Very close to opponent - backing off slightly")
+                    self.move_robot(-0.2, 0.0, 0.0, 0.1)
+                    strategy = self.get_random_attack_strategy()
+                else:
+                    # Normal attack mode
+                    if strategy is None:
+                        strategy = self.get_random_attack_strategy()
+                        if self.debug:
+                            self.get_logger().info(f"New Attack Strategy selected: {strategy}")
 
-                #Process the frame to move towards the red marker
-                if not self.move_towards_red_marker():
-                    self.search_for_red_marker() #Search for the red marker if not detected
+                    # Execute attack with the current strategy
+                    self.execute_attack_strategy(strategy, frame_center_x, cX)
 
-                cv2.imshow("Robot Camera Feed", self.frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            except Exception as ex:
-                self.get_logger().error("Error in sensor_listener loop: " + str(ex))
-                print("DEBUG: Error in sensor_listener loop: ", ex)
-            time.sleep(0.05)
-        cv2.destroyAllWindows()
+            time.sleep(0.020)
 
     ##################################################
-    # Main Loop
+    # Main Sumo Routine
     ##################################################
     def run_sumo(self):
-        self.get_logger().info("Robot is ready to move towards the red marker.")
-        print("DEBUG: Robot is ready to move towards the red marker.")
-        while rclpy.ok():
-            time.sleep(0.05)
+        self.get_logger().info("Robot ready for sumo wrestling. Starting quick attack loop...")
+        while self.frame is None and rclpy.ok():
+            time.sleep(0.01)  # Wait until the first frame is received
+        self.attack_opponent()
 
 def main(args=None):
     rclpy.init(args=args)
     mover = RobotMover()
 
+    # Start ROS spinning in a separate thread so callbacks work concurrently
     spin_thread = threading.Thread(target=rclpy.spin, args=(mover,))
     spin_thread.start()
 
-    sensor_thread = threading.Thread(target=mover.sensor_listener)
-    sensor_thread.start()
-
-    mover.get_logger().info("Sensor listener thread started.")
-    print("DEBUG: Sensor listener thread started.")
-
     try:
-        mover.run_talent_show()
+        mover.run_sumo()
     except KeyboardInterrupt:
-        mover.get_logger().info("Sumo interrupted.")
-        print("DEBUG: Sumo interrupted.")
-    mover.destroy_node()
-    rclpy.shutdown()
-    sensor_thread.join()
-    spin_thread.join()
+        mover.get_logger().info("Sumo wrestling interrupted.")
+    finally:
+        mover.stop_robot()
+        mover.destroy_node()
+        rclpy.shutdown()
+        spin_thread.join()
 
 if __name__ == '__main__':
     main()
