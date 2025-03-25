@@ -16,6 +16,8 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
+import atexit
+
 class AttackStrategy:
     """Enumeration of different attack strategies."""
     DIRECT = 1
@@ -135,14 +137,27 @@ class RobotMover(Node):
     ##################################################
     def lidar_callback(self, msg: LaserScan):
         """
-        Update the minimum distance reading from the LiDAR.
+        Update the minimum distance readings from the LiDAR.
         Warn if no valid ranges are received.
         """
         valid_ranges = [r for r in msg.ranges if not math.isinf(r) and not math.isnan(r)]
         if valid_ranges:
-            self.min_lidar_distance = min(valid_ranges)
+            # Assuming the LiDAR has 360 degrees of data
+            # Front: 0-30 degrees, Back: 150-210 degrees, Left: 60-120 degrees, Right: 240-300 degrees
+            front_distance = min(valid_ranges[0:30] + valid_ranges[330:360])  # Front
+            back_distance = min(valid_ranges[150:210])  # Back
+            left_distance = min(valid_ranges[60:120])  # Left
+            right_distance = min(valid_ranges[240:300])  # Right
+
+            self.front_distance = front_distance
+            self.back_distance = back_distance
+            self.left_distance = left_distance
+            self.right_distance = right_distance
         else:
-            self.min_lidar_distance = float('inf')
+            self.front_distance = float('inf')
+            self.back_distance = float('inf')
+            self.left_distance = float('inf')
+            self.right_distance = float('inf')
             self.get_logger().warning("No valid LiDAR data received!")
 
     ##################################################
@@ -167,15 +182,9 @@ class RobotMover(Node):
 
     def stop_robot(self):
         """Send a zero velocity command to stop the robot."""
-        msg = Twist()
-        self.publisher_cmd_vel.publish(msg)
-
-    ##################################################
-    # Strategy Functions
-    ##################################################
-    def get_random_attack_strategy(self):
-        """Randomly pick one of the attack strategies (excluding DEFENSIVE)."""
-        return random.choice([AttackStrategy.DIRECT, AttackStrategy.ZIGZAG, AttackStrategy.CIRCLE])
+        if self.publisher_cmd_vel:  # Check if the publisher is valid
+            msg = Twist()
+            self.publisher_cmd_vel.publish(msg)  # Publish a stop command
 
     def execute_attack_strategy(self, strategy, frame_center_x, cX):
         """
@@ -188,26 +197,34 @@ class RobotMover(Node):
         max_error = frame_center_x if frame_center_x != 0 else 1
         angular_z = -float(error_x) / max_error
 
+        # Set maximum speeds
+        max_linear_speed = 0.6
+        max_angular_speed = 2.0
+
         if strategy == AttackStrategy.DIRECT:
-            # Increase speed: move forward aggressively while turning slightly toward target
-            self.move_robot(0.5, 0.0, angular_z, 0.08)
+            # Move forward aggressively while turning slightly toward target
+            self.move_robot(max_linear_speed, 0.0, angular_z, 0.08)
         elif strategy == AttackStrategy.ZIGZAG:
             # Faster zigzag: alternate turning directions while advancing
             sign = 1 if random.random() < 0.5 else -1
-            self.move_robot(0.4, 0.0, sign * 1.2, 0.15)
-            self.move_robot(0.4, 0.0, -sign * 1.2, 0.15)
+            self.move_robot(max_linear_speed, 0.0, sign * max_angular_speed, 0.15)
+            self.move_robot(max_linear_speed, 0.0, -sign * max_angular_speed, 0.15)
         elif strategy == AttackStrategy.CIRCLE:
             # Quicker circling: move in an arc and then approach
-            self.move_robot(0.3, 0.0, 1.5, 0.3)
-            self.move_robot(0.5, 0.0, angular_z, 0.2)
+            self.move_robot(max_linear_speed * 0.5, 0.0, max_angular_speed, 0.3)  # Adjusted for circling
+            self.move_robot(max_linear_speed, 0.0, angular_z, 0.2)
         elif strategy == AttackStrategy.DEFENSIVE:
             # Quicker defensive maneuver: back off and rotate rapidly
-            self.move_robot(-0.4, 0.0, 0.7, 0.2)
-            self.move_robot(-0.5, 0.0, 0.0, 0.15)
+            self.move_robot(-max_linear_speed * 0.5, 0.0, max_angular_speed, 0.2)  # Adjusted for backing off
+            self.move_robot(-max_linear_speed, 0.0, 0.0, 0.15)
 
     ##################################################
     # Attack and Defensive Loop
     ##################################################
+    def get_random_attack_strategy(self):
+        """Randomly pick one of the attack strategies (excluding DEFENSIVE)."""
+        return random.choice([AttackStrategy.DIRECT, AttackStrategy.ZIGZAG, AttackStrategy.CIRCLE]) 
+    
     def attack_opponent(self):
         """
         Main loop: if an opponent is detected, choose an attack strategy.
@@ -216,34 +233,32 @@ class RobotMover(Node):
         to scan for one. Also, continuously check LiDAR to avoid walls.
         """
         strategy = None
-        wall_avoiding = False
 
         while rclpy.ok():
-            # Wall avoidance takes priority but should be smarter
-            if self.min_lidar_distance < self.wall_distance_threshold:
-                if self.debug:
-                    self.get_logger().info(f"Wall detected at distance: {self.min_lidar_distance}m")
-                
-                # Smarter wall avoidance - back up only briefly then try to turn away
-                self.move_robot(-0.3, 0.0, 0.0, 0.2)  # Gentler backup
-                
-                # If we detect the opponent while avoiding wall, turn towards it while backing up
-                if self.opponent_detected and self.opponent_center is not None:
-                    frame_center_x = self.frame.shape[1] // 2 if self.frame is not None else 0
-                    error_x = self.opponent_center[0] - frame_center_x
-                    # Turn towards opponent while backing up
-                    turn_direction = -1 if error_x > 0 else 1
-                    self.move_robot(-0.2, 0.0, turn_direction * 1.0, 0.3)
-                else:
-                    # No opponent visible, do a quick rotation to find new direction
-                    self.move_robot(0.0, 0.0, 1.0, 0.3)
-                
+            # Wall avoidance logic
+            if self.front_distance < self.wall_distance_threshold:
+                self.get_logger().info(f"Wall detected in front at distance: {self.front_distance}m")
+                self.move_robot(-0.3, 0.0, 0.0, 0.2)  # Move backwards
                 continue
 
-            # If no opponent is detected, rotate quickly to search
+            if self.back_distance < self.wall_distance_threshold:
+                self.get_logger().info(f"Wall detected behind at distance: {self.back_distance}m")
+                self.move_robot(0.3, 0.0, 0.0, 0.2)  # Move forwards
+                continue
+
+            if self.left_distance < self.wall_distance_threshold:
+                self.get_logger().info(f"Wall detected on the left at distance: {self.left_distance}m")
+                self.move_robot(0.0, 0.0, 1.0, 0.2)  # Turn right
+                continue
+
+            if self.right_distance < self.wall_distance_threshold:
+                self.get_logger().info(f"Wall detected on the right at distance: {self.right_distance}m")
+                self.move_robot(0.0, 0.0, -1.0, 0.2)  # Turn left
+                continue
+
+            # If no walls detected, proceed with opponent detection logic
             if not self.opponent_detected:
-                if self.debug:
-                    self.get_logger().info("No opponent detected. Scanning quickly...")
+                self.get_logger().info("No opponent detected. Scanning quickly...")
                 self.move_robot(0.0, 0.0, 2.0, 0.08)  # Slightly slower rotation for better detection
                 strategy = None
             else:
@@ -254,16 +269,14 @@ class RobotMover(Node):
 
                 # Use area to determine if we're too close to opponent
                 if self.opponent_area > 8000:  # Increased threshold
-                    if self.debug:
-                        self.get_logger().info("Very close to opponent - backing off slightly")
+                    self.get_logger().info("Very close to opponent - backing off slightly")
                     self.move_robot(-0.2, 0.0, 0.0, 0.1)
                     strategy = self.get_random_attack_strategy()
                 else:
                     # Normal attack mode
                     if strategy is None:
                         strategy = self.get_random_attack_strategy()
-                        if self.debug:
-                            self.get_logger().info(f"New Attack Strategy selected: {strategy}")
+                        self.get_logger().info(f"New Attack Strategy selected: {strategy}")
 
                     # Execute attack with the current strategy
                     self.execute_attack_strategy(strategy, frame_center_x, cX)
@@ -278,10 +291,20 @@ class RobotMover(Node):
         while self.frame is None and rclpy.ok():
             time.sleep(0.01)  # Wait until the first frame is received
         self.attack_opponent()
+        
+
+def shutdown_hook(mover):
+    """Function to stop the robot when shutting down."""
+    if rclpy.ok():  # Check if the node is still active
+        mover.stop_robot()  # Call the stop function to ensure motors are stopped
+        mover.get_logger().info("Robot stopped safely.")
 
 def main(args=None):
     rclpy.init(args=args)
     mover = RobotMover()
+
+    # Register the shutdown hook
+    atexit.register(shutdown_hook, mover)  # Pass the mover instance
 
     # Start ROS spinning in a separate thread so callbacks work concurrently
     spin_thread = threading.Thread(target=rclpy.spin, args=(mover,))
@@ -292,7 +315,7 @@ def main(args=None):
     except KeyboardInterrupt:
         mover.get_logger().info("Sumo wrestling interrupted.")
     finally:
-        mover.stop_robot()
+        mover.stop_robot()  # Ensure the robot stops
         mover.destroy_node()
         rclpy.shutdown()
         spin_thread.join()
